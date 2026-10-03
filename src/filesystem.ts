@@ -1,12 +1,25 @@
-import { join, resolve, relative, dirname } from 'path';
+import { join, resolve, relative, dirname, posix } from 'path';
 import { homedir } from 'os';
-import { readdir, stat, readFile, writeFile, unlink, mkdir, access, rename, copyFile } from 'node:fs/promises';
+import { readdir, stat, lstat, readFile, writeFile, unlink, mkdir, access, rename, copyFile } from 'node:fs/promises';
 import { constants, realpathSync } from 'node:fs';
 import trash from 'trash';
 import { FrontmatterHandler } from './frontmatter.js';
 import { PathFilter } from './pathfilter.js';
 import { generateObsidianUri } from './uri.js';
-import type { ParsedNote, DirectoryListing, NoteWriteParams, DeleteNoteParams, DeleteResult, MoveNoteParams, MoveFileParams, MoveResult, BatchReadParams, BatchReadResult, UpdateFrontmatterParams, NoteInfo, TagManagementParams, TagManagementResult, PatchNoteParams, PatchNoteResult, VaultStats, NoteHeading, ReadNoteLinesParams } from './types.js';
+import { MAX_IMAGE_BYTES, MAX_IMAGES_PER_CALL, decodeBase64Image, extractImageEmbeds, getImageMimeType, sniffImageMimeType, validateImageFilename } from './images.js';
+import type { ImageEmbed } from './images.js';
+import type { ParsedNote, DirectoryListing, NoteWriteParams, NoteWriteResult, NoteImageInput, NoteImage, NoteImagesResult, DeleteNoteParams, DeleteResult, MoveNoteParams, MoveFileParams, MoveResult, BatchReadParams, BatchReadResult, UpdateFrontmatterParams, NoteInfo, TagManagementParams, TagManagementResult, PatchNoteParams, PatchNoteResult, VaultStats, NoteHeading, ReadNoteLinesParams } from './types.js';
+
+/** An image validated by write_note and ready to be written. */
+interface PreparedImage {
+  path: string;
+  fullPath: string;
+  filename: string;
+  buffer: Buffer;
+  embed: boolean;
+}
+
+const DEFAULT_ATTACHMENT_FOLDER = 'attachments';
 
 /**
  * Map a filesystem write failure to a clear, accurate Error.
@@ -184,8 +197,9 @@ export class FileSystemService {
     }
   }
 
-  async writeNote(params: NoteWriteParams): Promise<void> {
-    const { content, frontmatter, mode = 'overwrite' } = params;
+  async writeNote(params: NoteWriteParams): Promise<NoteWriteResult> {
+    const { frontmatter, mode = 'overwrite' } = params;
+    let { content } = params;
     const path = this.normalizePath(params.path);
     const fullPath = this.resolvePath(path);
 
@@ -206,6 +220,15 @@ export class FileSystemService {
       }
     }
 
+    // Validate every image before anything touches the disk
+    const images = params.images == null
+      ? []
+      : await this.prepareImages(path, params.images, params.attachmentFolder);
+    if (images.length > 0) {
+      content = await this.appendImageEmbeds(content, images, mode);
+    }
+
+    const writtenImages: string[] = [];
     try {
       let finalContent: string;
 
@@ -252,12 +275,319 @@ export class FileSystemService {
         }
       }
 
+      for (const image of images) {
+        await mkdir(dirname(image.fullPath), { recursive: true });
+        try {
+          // wx: never overwrite, even if a file appeared since validation
+          await writeFile(image.fullPath, image.buffer, { flag: 'wx' });
+        } catch (error) {
+          if (error instanceof Error && 'code' in error && error.code === 'EEXIST') {
+            throw new Error(`Image already exists: ${image.path}. Choose a different filename.`);
+          }
+          throw error;
+        }
+        writtenImages.push(image.fullPath);
+      }
+
       // Create directories if they don't exist
       await mkdir(dirname(fullPath), { recursive: true });
       await writeFile(fullPath, finalContent!, 'utf-8');
     } catch (error) {
+      // Don't leave orphaned attachments behind when the write fails
+      await Promise.all(writtenImages.map((imagePath) => unlink(imagePath).catch(() => {})));
       throw classifyWriteError(error, path);
     }
+
+    return { images: images.map((image) => image.path) };
+  }
+
+  /**
+   * Validate write_note images and resolve where each will be saved. Throws
+   * on the first problem so a bad image never results in a partial write.
+   */
+  private async prepareImages(notePath: string, images: NoteImageInput[], attachmentFolder?: string): Promise<PreparedImage[]> {
+    if (!Array.isArray(images)) {
+      throw new Error('images must be an array of { filename, data } objects.');
+    }
+    if (images.length === 0) {
+      return [];
+    }
+    if (images.length > MAX_IMAGES_PER_CALL) {
+      throw new Error(`Too many images: ${images.length}. Maximum ${MAX_IMAGES_PER_CALL} images per write.`);
+    }
+
+    const folder = await this.resolveAttachmentFolder(notePath, attachmentFolder);
+    const seenNames = new Set<string>();
+    const prepared: PreparedImage[] = [];
+
+    for (const [index, image] of images.entries()) {
+      if (!image || typeof image !== 'object') {
+        throw new Error(`images[${index}] must be an object with filename and data.`);
+      }
+      const filename = validateImageFilename(image.filename);
+      // Case-insensitive: macOS and Windows filesystems would collide
+      if (seenNames.has(filename.toLowerCase())) {
+        throw new Error(`Duplicate image filename: ${filename}. Each image in a write must have a unique filename.`);
+      }
+      seenNames.add(filename.toLowerCase());
+
+      const { buffer } = decodeBase64Image(image.data, filename);
+      const imagePath = folder ? `${folder}/${filename}` : filename;
+      if (!this.pathFilter.isAllowedForListing(imagePath)) {
+        throw new Error(`Access denied: ${imagePath}. This path is restricted (system files like .obsidian, .git, and dotfiles are not accessible).`);
+      }
+      const imageFullPath = this.resolvePath(imagePath);
+      if (await lstat(imageFullPath).then(() => true, () => false)) {
+        throw new Error(`Image already exists: ${imagePath}. Choose a different filename.`);
+      }
+
+      prepared.push({ path: imagePath, fullPath: imageFullPath, filename, buffer, embed: image.embed !== false });
+    }
+
+    return prepared;
+  }
+
+  /**
+   * Resolve the folder new images are saved to: the caller's override, else
+   * Obsidian's "Default location for new attachments" setting, else
+   * "attachments". The setting is read internally — .obsidian stays
+   * unreachable through the tools — and the result is validated like any
+   * other path, so a hostile setting can't point outside the vault.
+   */
+  private async resolveAttachmentFolder(notePath: string, override?: string): Promise<string> {
+    let folder: string;
+    if (override != null) {
+      if (typeof override !== 'string') {
+        throw new Error('attachmentFolder must be a string.');
+      }
+      folder = override;
+    } else {
+      folder = await this.readObsidianAttachmentFolder(notePath);
+    }
+
+    folder = posix.normalize(this.normalizePath(folder).replace(/\\/g, '/')).replace(/^\/+|\/+$/g, '');
+    if (folder === '.') {
+      folder = '';
+    }
+
+    if (folder && !this.pathFilter.isAllowedForListing(folder)) {
+      throw new Error(`Access denied: ${folder}. Attachments cannot be saved in restricted folders (.obsidian, .git, dotfiles).`);
+    }
+    this.resolvePath(folder);
+    return folder;
+  }
+
+  private async readObsidianAttachmentFolder(notePath: string): Promise<string> {
+    const noteDir = posix.dirname(notePath) === '.' ? '' : posix.dirname(notePath);
+    try {
+      const config = JSON.parse(await readFile(join(this.vaultPath, '.obsidian', 'app.json'), 'utf-8'));
+      const setting = config?.attachmentFolderPath;
+      if (typeof setting === 'string' && setting.trim() !== '') {
+        const value = setting.trim().replace(/\\/g, '/');
+        if (value === '/') return '';
+        if (value === '.' || value === './') return noteDir;
+        if (value.startsWith('./')) return posix.join(noteDir, value.slice(2));
+        return value;
+      }
+    } catch {
+      // No Obsidian config, or it isn't valid JSON: use the default
+    }
+    return DEFAULT_ATTACHMENT_FOLDER;
+  }
+
+  /**
+   * Append an `![[...]]` embed for each image unless the content already
+   * embeds a file with that name. Links use the bare filename when it is
+   * unique in the vault (Obsidian's "shortest path") and the vault-relative
+   * path otherwise, so the embed can't resolve to a different file.
+   */
+  private async appendImageEmbeds(content: string, images: PreparedImage[], mode: NonNullable<NoteWriteParams['mode']>): Promise<string> {
+    const embedded = new Set(extractImageEmbeds(content).map((embed) => posix.basename(embed.target)));
+    const toEmbed = images.filter((image) => image.embed && !embedded.has(image.filename));
+    if (toEmbed.length === 0) {
+      return content;
+    }
+
+    const existing = await this.findFilesByName(new Set(toEmbed.map((image) => image.filename)));
+    const links = toEmbed.map((image) => {
+      const others = (existing.get(image.filename) ?? []).filter((p) => p !== image.path);
+      return `![[${others.length > 0 ? image.path : image.filename}]]`;
+    });
+
+    const separator = content === ''
+      ? (mode === 'append' ? '\n' : '')
+      : content.endsWith('\n\n') ? '' : content.endsWith('\n') ? '\n' : '\n\n';
+    return `${content}${separator}${links.join('\n')}\n`;
+  }
+
+  /**
+   * Read the local images a note embeds (`![[pic.png]]`, `![](pic.png)`),
+   * resolving targets the way Obsidian does: note-relative and vault-relative
+   * paths, then a vault-wide filename match for bare names. Every candidate
+   * passes the same path checks as other tools. Images that are missing,
+   * restricted, too large, or not real images are reported in `skipped`
+   * instead of failing the read.
+   */
+  async readNoteImages(notePath: string, content: string): Promise<NoteImagesResult> {
+    const path = this.normalizePath(notePath);
+    if (!this.pathFilter.isAllowed(path)) {
+      throw new Error(`Access denied: ${path}. This path is restricted (system files like .obsidian, .git, and dotfiles are not accessible).`);
+    }
+
+    const noteDir = posix.dirname(path) === '.' ? '' : posix.dirname(path);
+    const embeds = extractImageEmbeds(content);
+    const images: NoteImage[] = [];
+    const skipped: NoteImagesResult['skipped'] = [];
+    const seen = new Set<string>();
+
+    // One vault scan covers every bare filename, and only if one is needed
+    let byName: Map<string, string[]> | undefined;
+    const findByName = async (name: string): Promise<string[]> => {
+      byName ??= await this.findFilesByName(new Set(
+        embeds.filter((embed) => !embed.target.includes('/')).map((embed) => embed.target)
+      ));
+      return byName.get(name) ?? [];
+    };
+
+    for (const embed of embeds) {
+      let located: { path: string; fullPath: string; size: number } | undefined;
+      let firstError: string | undefined;
+
+      for (const candidate of this.imageCandidates(embed, noteDir)) {
+        const result = await this.locateImage(candidate);
+        if ('error' in result) {
+          firstError ??= result.error;
+        } else if (result.found) {
+          located = result.found;
+          break;
+        }
+      }
+      if (!located && !firstError && !embed.target.includes('/')) {
+        for (const candidate of await findByName(embed.target)) {
+          const result = await this.locateImage(candidate);
+          if (!('error' in result) && result.found) {
+            located = result.found;
+            break;
+          }
+        }
+      }
+
+      if (!located) {
+        skipped.push({ ref: embed.raw, error: firstError ?? `Image not found in vault: ${embed.target}` });
+        continue;
+      }
+      if (seen.has(located.path)) {
+        continue;
+      }
+      seen.add(located.path);
+
+      if (images.length >= MAX_IMAGES_PER_CALL) {
+        skipped.push({ ref: embed.raw, error: `Image limit reached (max ${MAX_IMAGES_PER_CALL} per note)` });
+        continue;
+      }
+      if (located.size > MAX_IMAGE_BYTES) {
+        skipped.push({ ref: embed.raw, error: `Image too large: ${located.path} (${located.size} bytes, max ${MAX_IMAGE_BYTES})` });
+        continue;
+      }
+
+      try {
+        const buffer = await readFile(located.fullPath);
+        const mimeType = sniffImageMimeType(buffer);
+        if (!mimeType) {
+          skipped.push({ ref: embed.raw, error: `Not a valid PNG, JPEG, GIF or WebP image: ${located.path}` });
+          continue;
+        }
+        images.push({ path: located.path, mimeType, data: buffer.toString('base64') });
+      } catch (error) {
+        skipped.push({ ref: embed.raw, error: `Failed to read image: ${located.path} - ${error instanceof Error ? error.message : 'Unknown error'}` });
+      }
+    }
+
+    return { images, skipped };
+  }
+
+  /** Vault-relative paths to try for an embed, in Obsidian's resolution order. */
+  private imageCandidates(embed: ImageEmbed, noteDir: string): string[] {
+    const target = posix.normalize(embed.target);
+    if (target.startsWith('/')) {
+      return [target];
+    }
+    const noteRelative = posix.join(noteDir, target);
+    if (!embed.target.includes('/')) {
+      return [noteRelative];
+    }
+    // Wiki links are written vault-relative; markdown links note-relative
+    const ordered = embed.kind === 'wiki' ? [target, noteRelative] : [noteRelative, target];
+    return [...new Set(ordered)];
+  }
+
+  /**
+   * Check a candidate image path against the vault security rules. Returns
+   * `{ error }` when the path is not allowed, `{ found }` for an existing
+   * file, and `{}` when nothing is there.
+   */
+  private async locateImage(candidate: string): Promise<{ error: string } | { found?: { path: string; fullPath: string; size: number } }> {
+    const path = this.normalizePath(candidate);
+    if (!this.pathFilter.isAllowedForListing(path) || !getImageMimeType(path)) {
+      return { error: `Access denied: ${path}. This path is restricted (system files like .obsidian, .git, and dotfiles are not accessible).` };
+    }
+    let fullPath: string;
+    try {
+      fullPath = this.resolvePath(path);
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : 'Invalid path' };
+    }
+    try {
+      const stats = await stat(fullPath);
+      return stats.isFile() ? { found: { path, fullPath, size: stats.size } } : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Find vault files whose basename is in `names`, skipping restricted paths.
+   * Each list is sorted root-first with an alphabetical tiebreak, matching
+   * findPathForWikiLink.
+   */
+  private async findFilesByName(names: Set<string>): Promise<Map<string, string[]>> {
+    const matches = new Map<string, string[]>();
+    if (names.size === 0) {
+      return matches;
+    }
+
+    const scan = async (dirPath: string, relativePath: string = ''): Promise<void> => {
+      let entries;
+      try {
+        entries = await readdir(dirPath, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const entryRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+        if (!this.pathFilter.isAllowedForListing(entryRelativePath)) {
+          continue;
+        }
+        if (entry.isDirectory()) {
+          await scan(join(dirPath, entry.name), entryRelativePath);
+        } else if (entry.isFile() && names.has(entry.name)) {
+          const list = matches.get(entry.name) ?? [];
+          list.push(entryRelativePath);
+          matches.set(entry.name, list);
+        }
+      }
+    };
+
+    await scan(this.vaultPath);
+
+    for (const list of matches.values()) {
+      list.sort((a, b) => {
+        const da = a.split('/').length;
+        const db = b.split('/').length;
+        return da !== db ? da - db : a.localeCompare(b);
+      });
+    }
+    return matches;
   }
 
   async patchNote(params: PatchNoteParams): Promise<PatchNoteResult> {

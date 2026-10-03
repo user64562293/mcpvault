@@ -31,6 +31,7 @@ export function createServer(vaultPath, options = {}) {
                     type: "object",
                     properties: {
                         path: { type: "string", description: "Path to the note relative to vault root" },
+                        includeImages: { type: "boolean", description: "Also return images embedded in the note (![[image.png]] or ![](image.png)) as image content blocks, listed in order under 'imgs'. Local PNG, JPEG, GIF and WebP files only; max 10 images of 5 MB each (default: false)", default: false },
                         prettyPrint: { type: "boolean", description: "Format JSON response with indentation (default: false)", default: false }
                     },
                     required: ["path"]
@@ -38,14 +39,29 @@ export function createServer(vaultPath, options = {}) {
             },
             {
                 name: "write_note",
-                description: "Write a note to the Obsidian vault",
+                description: "Write a note to the Obsidian vault, optionally saving images alongside it",
                 inputSchema: {
                     type: "object",
                     properties: {
                         path: { type: "string", description: "Path to the note relative to vault root" },
                         content: { type: "string", description: "Content of the note" },
                         frontmatter: { type: "object", description: "Frontmatter object (optional)" },
-                        mode: { type: "string", enum: ["overwrite", "append", "prepend"], description: "Write mode: 'overwrite' (default), 'append', or 'prepend'", default: "overwrite" }
+                        mode: { type: "string", enum: ["overwrite", "append", "prepend"], description: "Write mode: 'overwrite' (default), 'append', or 'prepend'", default: "overwrite" },
+                        images: {
+                            type: "array",
+                            maxItems: 10,
+                            description: "Images to save into the vault with this note (PNG, JPEG, GIF or WebP; max 10, 5 MB each). Each is saved in the attachment folder and embedded at the end of the content as ![[filename]] unless the content already embeds it. Existing files are never overwritten.",
+                            items: {
+                                type: "object",
+                                properties: {
+                                    filename: { type: "string", description: "File name only, e.g. 'diagram.png'" },
+                                    data: { type: "string", description: "Base64-encoded image bytes (a data:image/...;base64, prefix is accepted)" },
+                                    embed: { type: "boolean", description: "Append an ![[...]] embed to the content (default: true)", default: true }
+                                },
+                                required: ["filename", "data"]
+                            }
+                        },
+                        attachmentFolder: { type: "string", description: "Folder for saved images, relative to vault root. Default: the vault's Obsidian attachment setting, else 'attachments'" }
                     },
                     required: ["path", "content"]
                 }
@@ -288,20 +304,40 @@ export function createServer(vaultPath, options = {}) {
                 case "read_note": {
                     const note = await fileSystem.readNote(trimmedArgs.path);
                     const indent = trimmedArgs.prettyPrint ? 2 : undefined;
+                    if (!trimmedArgs.includeImages) {
+                        return {
+                            content: [{ type: "text", text: JSON.stringify({ fm: note.frontmatter, content: note.content }, null, indent) }]
+                        };
+                    }
+                    const { images, skipped } = await fileSystem.readNoteImages(trimmedArgs.path, note.content);
                     return {
-                        content: [{ type: "text", text: JSON.stringify({ fm: note.frontmatter, content: note.content }, null, indent) }]
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify({
+                                    fm: note.frontmatter,
+                                    content: note.content,
+                                    imgs: images.map((image) => image.path),
+                                    ...(skipped.length > 0 && { imgErr: skipped.map((s) => ({ ref: s.ref, err: s.error })) })
+                                }, null, indent)
+                            },
+                            ...images.map((image) => ({ type: "image", data: image.data, mimeType: image.mimeType }))
+                        ]
                     };
                 }
                 case "write_note": {
                     const fm = parseFrontmatter(trimmedArgs.frontmatter);
-                    await fileSystem.writeNote({
+                    const result = await fileSystem.writeNote({
                         path: trimmedArgs.path,
                         content: trimmedArgs.content,
                         ...(fm !== undefined && { frontmatter: fm }),
-                        mode: trimmedArgs.mode || 'overwrite'
+                        mode: trimmedArgs.mode || 'overwrite',
+                        ...(trimmedArgs.images != null && { images: trimmedArgs.images }),
+                        ...(trimmedArgs.attachmentFolder != null && { attachmentFolder: trimmedArgs.attachmentFolder })
                     });
+                    const savedImages = result.images.length > 0 ? `; saved images: ${result.images.join(', ')}` : '';
                     return {
-                        content: [{ type: "text", text: `Successfully wrote note: ${trimmedArgs.path} (mode: ${trimmedArgs.mode || 'overwrite'})` }]
+                        content: [{ type: "text", text: `Successfully wrote note: ${trimmedArgs.path} (mode: ${trimmedArgs.mode || 'overwrite'})${savedImages}` }]
                     };
                 }
                 case "patch_note": {
@@ -484,6 +520,8 @@ function trimPaths(args) {
         trimmed.confirmOldPath = trimmed.confirmOldPath.trim();
     if (trimmed.confirmNewPath && typeof trimmed.confirmNewPath === 'string')
         trimmed.confirmNewPath = trimmed.confirmNewPath.trim();
+    if (trimmed.attachmentFolder && typeof trimmed.attachmentFolder === 'string')
+        trimmed.attachmentFolder = trimmed.attachmentFolder.trim();
     if (trimmed.paths && Array.isArray(trimmed.paths)) {
         trimmed.paths = trimmed.paths.map((p) => typeof p === 'string' ? p.trim() : p);
     }

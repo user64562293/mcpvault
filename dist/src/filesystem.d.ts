@@ -1,6 +1,6 @@
 import { FrontmatterHandler } from './frontmatter.js';
 import { PathFilter } from './pathfilter.js';
-import type { ParsedNote, DirectoryListing, NoteWriteParams, DeleteNoteParams, DeleteResult, MoveNoteParams, MoveFileParams, MoveResult, BatchReadParams, BatchReadResult, UpdateFrontmatterParams, NoteInfo, TagManagementParams, TagManagementResult, PatchNoteParams, PatchNoteResult, VaultStats, NoteHeading, ReadNoteLinesParams } from './types.js';
+import type { ParsedNote, DirectoryListing, NoteWriteParams, NoteWriteResult, NoteImagesResult, DeleteNoteParams, DeleteResult, MoveNoteParams, MoveFileParams, MoveResult, BatchReadParams, BatchReadResult, UpdateFrontmatterParams, NoteInfo, TagManagementParams, TagManagementResult, PatchNoteParams, PatchNoteResult, VaultStats, NoteHeading, ReadNoteLinesParams } from './types.js';
 /**
  * Map a filesystem write failure to a clear, accurate Error.
  *
@@ -24,7 +24,51 @@ export declare class FileSystemService {
     private normalizePath;
     private resolvePath;
     readNote(path: string): Promise<ParsedNote>;
-    writeNote(params: NoteWriteParams): Promise<void>;
+    writeNote(params: NoteWriteParams): Promise<NoteWriteResult>;
+    /**
+     * Validate write_note images and resolve where each will be saved. Throws
+     * on the first problem so a bad image never results in a partial write.
+     */
+    private prepareImages;
+    /**
+     * Resolve the folder new images are saved to: the caller's override, else
+     * Obsidian's "Default location for new attachments" setting, else
+     * "attachments". The setting is read internally — .obsidian stays
+     * unreachable through the tools — and the result is validated like any
+     * other path, so a hostile setting can't point outside the vault.
+     */
+    private resolveAttachmentFolder;
+    private readObsidianAttachmentFolder;
+    /**
+     * Append an `![[...]]` embed for each image unless the content already
+     * embeds a file with that name. Links use the bare filename when it is
+     * unique in the vault (Obsidian's "shortest path") and the vault-relative
+     * path otherwise, so the embed can't resolve to a different file.
+     */
+    private appendImageEmbeds;
+    /**
+     * Read the local images a note embeds (`![[pic.png]]`, `![](pic.png)`),
+     * resolving targets the way Obsidian does: note-relative and vault-relative
+     * paths, then a vault-wide filename match for bare names. Every candidate
+     * passes the same path checks as other tools. Images that are missing,
+     * restricted, too large, or not real images are reported in `skipped`
+     * instead of failing the read.
+     */
+    readNoteImages(notePath: string, content: string): Promise<NoteImagesResult>;
+    /** Vault-relative paths to try for an embed, in Obsidian's resolution order. */
+    private imageCandidates;
+    /**
+     * Check a candidate image path against the vault security rules. Returns
+     * `{ error }` when the path is not allowed, `{ found }` for an existing
+     * file, and `{}` when nothing is there.
+     */
+    private locateImage;
+    /**
+     * Find vault files whose basename is in `names`, skipping restricted paths.
+     * Each list is sorted root-first with an alphabetical tiebreak, matching
+     * findPathForWikiLink.
+     */
+    private findFilesByName;
     patchNote(params: PatchNoteParams): Promise<PatchNoteResult>;
     listDirectory(path?: string): Promise<DirectoryListing>;
     exists(path: string): Promise<boolean>;

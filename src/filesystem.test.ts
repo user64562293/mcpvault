@@ -1,7 +1,7 @@
 import { test, expect, beforeEach, afterEach, describe } from "vitest";
 import { FileSystemService, classifyWriteError } from "./filesystem.js";
 import { PathFilter } from "./pathfilter.js";
-import { writeFile, readFile, mkdir, mkdtemp, rm, symlink } from "fs/promises";
+import { writeFile, readFile, readdir, mkdir, mkdtemp, rm, symlink } from "fs/promises";
 import { join, relative } from "path";
 import { tmpdir, homedir } from "os";
 
@@ -1993,5 +1993,367 @@ describe("findPathForWikiLink (#101)", () => {
     await writeFile(join(testVaultPath, "a/b/Note.md"), "# nested");
     const matches = await fileSystem.findPathForWikiLink("a/b/Note");
     expect(matches).toEqual(["a/b/Note.md"]);
+  });
+});
+
+// ============================================================================
+// IMAGE TESTS
+// ============================================================================
+
+// 1x1 transparent PNG
+const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+const PNG_BYTES = Buffer.from(PNG_BASE64, "base64");
+
+async function writeVaultFile(relativePath: string, data: string | Buffer) {
+  const fullPath = join(testVaultPath, relativePath);
+  await mkdir(join(fullPath, ".."), { recursive: true });
+  await writeFile(fullPath, data);
+}
+
+describe("readNoteImages", () => {
+  test("returns a same-folder wiki embed as base64 with sniffed mime type", async () => {
+    await writeVaultFile("notes/pic.png", PNG_BYTES);
+    const result = await fileSystem.readNoteImages("notes/note.md", "Look: ![[pic.png]]");
+    expect(result.skipped).toEqual([]);
+    expect(result.images).toEqual([{ path: "notes/pic.png", mimeType: "image/png", data: PNG_BASE64 }]);
+  });
+
+  test("resolves bare names anywhere in the vault, root-first", async () => {
+    await writeVaultFile("attachments/pic.png", PNG_BYTES);
+    await writeVaultFile("z/deeper/pic.png", PNG_BYTES);
+    const result = await fileSystem.readNoteImages("notes/note.md", "![[pic.png]]");
+    expect(result.images.map((i) => i.path)).toEqual(["attachments/pic.png"]);
+  });
+
+  test("prefers the note's folder over a vault-wide match", async () => {
+    await writeVaultFile("pic.png", PNG_BYTES);
+    await writeVaultFile("notes/pic.png", PNG_BYTES);
+    const result = await fileSystem.readNoteImages("notes/note.md", "![[pic.png]]");
+    expect(result.images.map((i) => i.path)).toEqual(["notes/pic.png"]);
+  });
+
+  test("resolves markdown images note-relative, then vault-relative", async () => {
+    await writeVaultFile("notes/img/a.png", PNG_BYTES);
+    await writeVaultFile("assets/b.png", PNG_BYTES);
+    await writeVaultFile("shared/c.png", PNG_BYTES);
+    const content = "![](img/a.png)\n![](assets/b.png)\n![](../shared/c.png)\n![](/assets/b.png)";
+    const result = await fileSystem.readNoteImages("notes/note.md", content);
+    expect(result.skipped).toEqual([]);
+    // The second reference to assets/b.png is deduplicated
+    expect(result.images.map((i) => i.path)).toEqual(["notes/img/a.png", "assets/b.png", "shared/c.png"]);
+  });
+
+  test("resolves path-qualified wiki embeds vault-relative and URL-encoded markdown names", async () => {
+    await writeVaultFile("assets/my pic.png", PNG_BYTES);
+    const result = await fileSystem.readNoteImages("notes/note.md", "![[assets/my pic.png]]\n![](my%20pic.png)");
+    // Both point at the same file: returned once
+    expect(result.images.map((i) => i.path)).toEqual(["assets/my pic.png"]);
+    expect(result.skipped).toEqual([]);
+  });
+
+  test("normalizes ./ and ../ segments so one file is returned once", async () => {
+    await writeVaultFile("notes/pic.png", PNG_BYTES);
+    const result = await fileSystem.readNoteImages("notes/note.md", "![[pic.png]]\n![[./notes/pic.png]]\n![](./pic.png)\n![](../notes/pic.png)");
+    expect(result.images.map((i) => i.path)).toEqual(["notes/pic.png"]);
+    expect(result.skipped).toEqual([]);
+  });
+
+  test("reports missing images in skipped without failing the read", async () => {
+    const result = await fileSystem.readNoteImages("note.md", "![[missing.png]]");
+    expect(result.images).toEqual([]);
+    expect(result.skipped).toEqual([{ ref: "![[missing.png]]", error: "Image not found in vault: missing.png" }]);
+  });
+
+  test("never reads outside the vault via traversal", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "mcpvault-outside-"));
+    try {
+      await writeFile(join(outside, "secret.png"), PNG_BYTES);
+      const rel = relative(testVaultPath, join(outside, "secret.png"));
+      const result = await fileSystem.readNoteImages("note.md", `![](${rel})\n![[${rel}]]`);
+      expect(result.images).toEqual([]);
+      expect(result.skipped).toHaveLength(2);
+    } finally {
+      await rm(outside, { recursive: true });
+    }
+  });
+
+  test("never reads restricted folders or hidden files", async () => {
+    await writeVaultFile(".obsidian/icon.png", PNG_BYTES);
+    await writeVaultFile(".hidden.png", PNG_BYTES);
+    const result = await fileSystem.readNoteImages("note.md", "![[.obsidian/icon.png]]\n![](.obsidian/icon.png)\n![[.hidden.png]]");
+    expect(result.images).toEqual([]);
+    expect(result.skipped).toHaveLength(3);
+    for (const entry of result.skipped) {
+      expect(entry.error).toMatch(/Access denied/);
+    }
+  });
+
+  test("does not find bare names inside restricted folders", async () => {
+    await writeVaultFile(".obsidian/plugins/x/pic.png", PNG_BYTES);
+    const result = await fileSystem.readNoteImages("note.md", "![[pic.png]]");
+    expect(result.images).toEqual([]);
+    expect(result.skipped[0]!.error).toMatch(/not found/);
+  });
+
+  test("rejects symlinked images that point outside the vault", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "mcpvault-outside-"));
+    try {
+      await writeFile(join(outside, "secret.png"), PNG_BYTES);
+      await symlink(join(outside, "secret.png"), join(testVaultPath, "link.png"));
+      const result = await fileSystem.readNoteImages("note.md", "![[link.png]]");
+      expect(result.images).toEqual([]);
+      expect(result.skipped[0]!.error).toMatch(/outside vault/);
+    } finally {
+      await rm(outside, { recursive: true });
+    }
+  });
+
+  test("skips files that are not real images", async () => {
+    await writeVaultFile("fake.png", "just text");
+    const result = await fileSystem.readNoteImages("note.md", "![[fake.png]]");
+    expect(result.images).toEqual([]);
+    expect(result.skipped[0]!.error).toMatch(/Not a valid PNG, JPEG, GIF or WebP image/);
+  });
+
+  test("skips images over 5 MB", async () => {
+    const big = Buffer.alloc(5 * 1024 * 1024 + 1);
+    big.set(PNG_BYTES);
+    await writeVaultFile("big.png", big);
+    const result = await fileSystem.readNoteImages("note.md", "![[big.png]]");
+    expect(result.images).toEqual([]);
+    expect(result.skipped[0]!.error).toMatch(/too large/);
+  });
+
+  test("returns at most 10 images and reports the rest", async () => {
+    const lines: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      await writeVaultFile(`img${i}.png`, PNG_BYTES);
+      lines.push(`![[img${i}.png]]`);
+    }
+    const result = await fileSystem.readNoteImages("note.md", lines.join("\n"));
+    expect(result.images).toHaveLength(10);
+    expect(result.skipped.map((s) => s.ref)).toEqual(["![[img10.png]]", "![[img11.png]]"]);
+    expect(result.skipped[0]!.error).toMatch(/limit reached/);
+  });
+
+  test("ignores images inside code fences", async () => {
+    await writeVaultFile("pic.png", PNG_BYTES);
+    const result = await fileSystem.readNoteImages("note.md", "```\n![[pic.png]]\n```");
+    expect(result).toEqual({ images: [], skipped: [] });
+  });
+
+  test("denies restricted note paths", async () => {
+    await expect(fileSystem.readNoteImages(".obsidian/note.md", "![[pic.png]]")).rejects.toThrow(/Access denied/);
+  });
+});
+
+describe("writeNote with images", () => {
+  test("saves images to attachments/ by default and embeds them", async () => {
+    const result = await fileSystem.writeNote({
+      path: "Trip.md",
+      content: "# Trip",
+      images: [{ filename: "beach.png", data: PNG_BASE64 }],
+    });
+    expect(result.images).toEqual(["attachments/beach.png"]);
+    expect((await readFile(join(testVaultPath, "attachments/beach.png"))).equals(PNG_BYTES)).toBe(true);
+    expect(await readFile(join(testVaultPath, "Trip.md"), "utf-8")).toBe("# Trip\n\n![[beach.png]]\n");
+  });
+
+  test("returns no images for a plain write", async () => {
+    const result = await fileSystem.writeNote({ path: "plain.md", content: "text" });
+    expect(result).toEqual({ images: [] });
+  });
+
+  test("written images can be read back through the note", async () => {
+    await fileSystem.writeNote({
+      path: "notes/Trip.md",
+      content: "# Trip\n",
+      images: [{ filename: "a.png", data: PNG_BASE64 }, { filename: "b.png", data: `data:image/png;base64,${PNG_BASE64}` }],
+    });
+    const note = await fileSystem.readNote("notes/Trip.md");
+    expect(note.content).toBe("# Trip\n\n![[a.png]]\n![[b.png]]\n");
+    const { images, skipped } = await fileSystem.readNoteImages("notes/Trip.md", note.content);
+    expect(skipped).toEqual([]);
+    expect(images.map((i) => i.path)).toEqual(["attachments/a.png", "attachments/b.png"]);
+  });
+
+  test.each([
+    ["/", "pic.png"],
+    ["./", "notes/pic.png"],
+    ["./assets", "notes/assets/pic.png"],
+    ["Media/Images", "Media/Images/pic.png"],
+  ])("follows Obsidian attachmentFolderPath %s", async (setting, expected) => {
+    await writeVaultFile(".obsidian/app.json", JSON.stringify({ attachmentFolderPath: setting }));
+    const result = await fileSystem.writeNote({
+      path: "notes/note.md",
+      content: "x",
+      images: [{ filename: "pic.png", data: PNG_BASE64 }],
+    });
+    expect(result.images).toEqual([expected]);
+    expect((await readFile(join(testVaultPath, expected))).equals(PNG_BYTES)).toBe(true);
+  });
+
+  test("falls back to attachments/ when the Obsidian config is invalid", async () => {
+    await writeVaultFile(".obsidian/app.json", "{ not json");
+    const result = await fileSystem.writeNote({ path: "n.md", content: "", images: [{ filename: "p.png", data: PNG_BASE64 }] });
+    expect(result.images).toEqual(["attachments/p.png"]);
+  });
+
+  test.each([".git", ".obsidian/plugins", "../outside"])("rejects a hostile attachmentFolderPath %s", async (setting) => {
+    await writeVaultFile(".obsidian/app.json", JSON.stringify({ attachmentFolderPath: setting }));
+    await expect(fileSystem.writeNote({
+      path: "n.md",
+      content: "x",
+      images: [{ filename: "p.png", data: PNG_BASE64 }],
+    })).rejects.toThrow(/Access denied|traversal/);
+    await expect(readFile(join(testVaultPath, "n.md"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("attachmentFolder overrides the Obsidian setting", async () => {
+    await writeVaultFile(".obsidian/app.json", JSON.stringify({ attachmentFolderPath: "Media" }));
+    const result = await fileSystem.writeNote({
+      path: "n.md",
+      content: "x",
+      attachmentFolder: "/custom/imgs/",
+      images: [{ filename: "p.png", data: PNG_BASE64 }],
+    });
+    expect(result.images).toEqual(["custom/imgs/p.png"]);
+  });
+
+  test("attachmentFolder '' saves to the vault root", async () => {
+    const result = await fileSystem.writeNote({
+      path: "folder/n.md",
+      content: "x",
+      attachmentFolder: "",
+      images: [{ filename: "p.png", data: PNG_BASE64 }],
+    });
+    expect(result.images).toEqual(["p.png"]);
+  });
+
+  test.each([".git", "../outside", "a/../../outside"])("rejects attachmentFolder %s", async (folder) => {
+    await expect(fileSystem.writeNote({
+      path: "n.md",
+      content: "x",
+      attachmentFolder: folder,
+      images: [{ filename: "p.png", data: PNG_BASE64 }],
+    })).rejects.toThrow(/Access denied|traversal/);
+  });
+
+  test.each(["../x.png", "a/b.png", ".h.png", "x.svg"])("rejects filename %s", async (filename) => {
+    await expect(fileSystem.writeNote({
+      path: "n.md",
+      content: "x",
+      images: [{ filename, data: PNG_BASE64 }],
+    })).rejects.toThrow(/Invalid image filename|Unsupported image type/);
+    await expect(readFile(join(testVaultPath, "n.md"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("rejects bytes that don't match the extension", async () => {
+    await expect(fileSystem.writeNote({
+      path: "n.md",
+      content: "x",
+      images: [{ filename: "p.jpg", data: PNG_BASE64 }],
+    })).rejects.toThrow(/does not match the file extension/);
+  });
+
+  test("never overwrites an existing image and writes nothing", async () => {
+    await writeVaultFile("attachments/b.png", "original");
+    await expect(fileSystem.writeNote({
+      path: "n.md",
+      content: "x",
+      images: [{ filename: "a.png", data: PNG_BASE64 }, { filename: "b.png", data: PNG_BASE64 }],
+    })).rejects.toThrow("Image already exists: attachments/b.png. Choose a different filename.");
+    expect(await readFile(join(testVaultPath, "attachments/b.png"), "utf-8")).toBe("original");
+    expect(await readdir(join(testVaultPath, "attachments"))).toEqual(["b.png"]);
+    await expect(readFile(join(testVaultPath, "n.md"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("treats null images and attachmentFolder as absent", async () => {
+    const result = await fileSystem.writeNote({ path: "n.md", content: "x", images: null as any, attachmentFolder: null as any });
+    expect(result.images).toEqual([]);
+    const withImages = await fileSystem.writeNote({
+      path: "m.md",
+      content: "x",
+      attachmentFolder: null as any,
+      images: [{ filename: "p.png", data: PNG_BASE64 }],
+    });
+    expect(withImages.images).toEqual(["attachments/p.png"]);
+  });
+
+  test("rejects non-array images", async () => {
+    await expect(fileSystem.writeNote({ path: "n.md", content: "x", images: "p.png" as any })).rejects.toThrow(/images must be an array/);
+  });
+
+  test("rejects duplicate filenames and too many images", async () => {
+    await expect(fileSystem.writeNote({
+      path: "n.md",
+      content: "x",
+      images: [{ filename: "a.png", data: PNG_BASE64 }, { filename: "A.PNG", data: PNG_BASE64 }],
+    })).rejects.toThrow(/Duplicate image filename/);
+
+    const eleven = Array.from({ length: 11 }, (_, i) => ({ filename: `p${i}.png`, data: PNG_BASE64 }));
+    await expect(fileSystem.writeNote({ path: "n.md", content: "x", images: eleven })).rejects.toThrow(/Too many images/);
+  });
+
+  test("removes saved images when the note write fails", async () => {
+    // A directory where the note should be makes the note write fail after images are saved
+    await mkdir(join(testVaultPath, "blocked.md"), { recursive: true });
+    await expect(fileSystem.writeNote({
+      path: "blocked.md",
+      content: "x",
+      images: [{ filename: "p.png", data: PNG_BASE64 }],
+    })).rejects.toThrow();
+    await expect(readFile(join(testVaultPath, "attachments/p.png"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("does not duplicate an embed the content already has", async () => {
+    await fileSystem.writeNote({
+      path: "n.md",
+      content: "Intro ![[p.png|200]] and ![](attachments/q.png)",
+      images: [{ filename: "p.png", data: PNG_BASE64 }, { filename: "q.png", data: PNG_BASE64 }],
+    });
+    expect(await readFile(join(testVaultPath, "n.md"), "utf-8")).toBe("Intro ![[p.png|200]] and ![](attachments/q.png)");
+  });
+
+  test("embed: false saves without embedding", async () => {
+    const result = await fileSystem.writeNote({
+      path: "n.md",
+      content: "x",
+      images: [{ filename: "p.png", data: PNG_BASE64, embed: false }],
+    });
+    expect(result.images).toEqual(["attachments/p.png"]);
+    expect(await readFile(join(testVaultPath, "n.md"), "utf-8")).toBe("x");
+  });
+
+  test("uses the vault path in the embed when the filename is ambiguous", async () => {
+    await writeVaultFile("other/p.png", PNG_BYTES);
+    await fileSystem.writeNote({
+      path: "n.md",
+      content: "x\n",
+      images: [{ filename: "p.png", data: PNG_BASE64 }],
+    });
+    expect(await readFile(join(testVaultPath, "n.md"), "utf-8")).toBe("x\n\n![[attachments/p.png]]\n");
+  });
+
+  test("append mode embeds after the appended content", async () => {
+    await writeVaultFile("n.md", "---\ntitle: T\n---\nExisting\n");
+    await fileSystem.writeNote({
+      path: "n.md",
+      content: "New line",
+      mode: "append",
+      images: [{ filename: "p.png", data: PNG_BASE64 }],
+    });
+    expect(await readFile(join(testVaultPath, "n.md"), "utf-8")).toBe("---\ntitle: T\n---\nExisting\nNew line\n\n![[p.png]]\n");
+  });
+
+  test("prepend mode keeps embeds separate from existing content", async () => {
+    await writeVaultFile("n.md", "Existing");
+    await fileSystem.writeNote({
+      path: "n.md",
+      content: "",
+      mode: "prepend",
+      images: [{ filename: "p.png", data: PNG_BASE64 }],
+    });
+    expect(await readFile(join(testVaultPath, "n.md"), "utf-8")).toBe("![[p.png]]\nExisting");
   });
 });

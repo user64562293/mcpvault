@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Image support in `read_note` and `write_note`. `read_note` with `includeImages: true` returns the images a note embeds (`![[pic.png]]`, `![](pic.png)`) as MCP image content. `write_note` accepts base64 `images`, saves them to the vault's Obsidian attachment folder (or `attachmentFolder`, defaulting to `attachments/`), and embeds them in the note. PNG, JPEG, GIF, and WebP only; up to 10 images of 5 MB each; images are never overwritten or fetched from URLs.
+
 ## [0.16.0] - 2026-08-17
 
 ### Changed

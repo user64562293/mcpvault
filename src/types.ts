@@ -10,6 +10,40 @@ export interface NoteWriteParams {
   content: string;
   frontmatter?: Record<string, any>;
   mode?: 'overwrite' | 'append' | 'prepend';
+  /** Images to save into the attachment folder alongside the note. */
+  images?: NoteImageInput[];
+  /** Folder for saved images, relative to vault root. Defaults to Obsidian's attachment setting, then "attachments". */
+  attachmentFolder?: string;
+}
+
+export interface NoteImageInput {
+  /** File name only, e.g. "diagram.png". */
+  filename: string;
+  /** Base64-encoded image bytes; a `data:image/...;base64,` prefix is accepted. */
+  data: string;
+  /** Append an `![[...]]` embed to the content unless it already embeds the file (default: true). */
+  embed?: boolean;
+}
+
+export interface NoteWriteResult {
+  /** Vault-relative paths of the images saved by this write. */
+  images: string[];
+}
+
+// Note image types
+export interface NoteImage {
+  path: string;
+  mimeType: string;
+  /** Base64-encoded image bytes. */
+  data: string;
+}
+
+export interface NoteImagesResult {
+  images: NoteImage[];
+  skipped: Array<{
+    ref: string;
+    error: string;
+  }>;
 }
 
 export interface PatchNoteParams {

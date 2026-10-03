@@ -116,7 +116,8 @@ An MCP client starts MCPVault as a local stdio process and passes the vault path
   - Search: `search_notes` with multi-word matching and BM25 reranking
   - Metadata and tags: `get_frontmatter`, `update_frontmatter`, `get_notes_info`, `get_vault_stats`, `manage_tags`, `list_all_tags`
   - Wiki links: `wiki_link` resolves names and returns alternative paths when a name is ambiguous
-- `write_note` supports overwrite, append, and prepend modes.
+- `write_note` supports overwrite, append, and prepend modes, and can save images into the vault and embed them in the note.
+- `read_note` can return the images a note embeds (`![[pic.png]]`, `![](pic.png)`) as MCP image content with `includeImages: true`.
 - `delete_note` and `move_file` require matching confirmation paths.
 - Path arguments are trimmed before validation.
 - Search and batch tools return compact fields by default; set `prettyPrint: true` for expanded output.
@@ -469,6 +470,34 @@ Read a note from the vault with parsed frontmatter.
 }
 ```
 
+**Reading embedded images:**
+
+Set `includeImages: true` to also get the images the note embeds, as MCP image content blocks after the JSON text block. MCPVault recognizes Obsidian embeds (`![[pic.png]]`, `![[pic.png|300]]`) and markdown images (`![alt](pic.png)`) and resolves them the way Obsidian does: relative to the note, relative to the vault root, then by file name anywhere in the vault. Embeds inside code blocks and remote URLs are ignored.
+
+- Supported formats: PNG, JPEG, GIF, and WebP
+- Limits: up to 10 images per note, 5 MB each
+- `imgs` lists the vault paths of the returned images, in the same order as the image blocks
+- `imgErr` lists embeds that could not be loaded (missing, restricted, too large, or not a valid image); they never fail the read
+
+```json
+{
+  "name": "read_note",
+  "arguments": {
+    "path": "Trip.md",
+    "includeImages": true
+  }
+}
+```
+
+**Response content:**
+
+```json
+[
+  { "type": "text", "text": "{\"fm\":{},\"content\":\"# Trip\\n\\n![[beach.png]]\\n![[missing.png]]\\n\",\"imgs\":[\"attachments/beach.png\"],\"imgErr\":[{\"ref\":\"![[missing.png]]\",\"err\":\"Image not found in vault: missing.png\"}]}" },
+  { "type": "image", "data": "iVBORw0KGgo...", "mimeType": "image/png" }
+]
+```
+
 ### `write_note`
 
 Write a note to the vault with optional frontmatter and write mode.
@@ -510,6 +539,29 @@ Write a note to the vault with optional frontmatter and write mode.
 }
 ```
 
+**Request (With images):**
+
+```json
+{
+  "name": "write_note",
+  "arguments": {
+    "path": "Trip.md",
+    "content": "# Trip\n",
+    "images": [
+      { "filename": "beach.png", "data": "iVBORw0KGgo..." }
+    ]
+  }
+}
+```
+
+Each image is decoded from base64 (a `data:image/...;base64,` prefix is accepted), saved in the attachment folder, and embedded at the end of `content` as `![[beach.png]]`. The embed uses the vault-relative path instead when another file in the vault has the same name.
+
+- **Attachment folder:** `attachmentFolder` if given, otherwise the vault's Obsidian setting for new attachments (`/`, `./`, `./subfolder`, or a folder path), otherwise `attachments/`
+- **Embedding:** skipped when `content` already embeds the file, or when the image sets `"embed": false`
+- **No overwrites:** if a file with that name already exists, the call fails and nothing is written
+- **Validation:** file names only (no folders or hidden files); PNG, JPEG, GIF, or WebP data that matches the extension; up to 10 images per call, 5 MB each
+- **All or nothing:** every image is validated before anything is written, and saved images are removed if the note write fails
+
 **Response:**
 
 ```json
@@ -517,6 +569,8 @@ Write a note to the vault with optional frontmatter and write mode.
   "message": "Successfully wrote note: meeting-notes.md (mode: overwrite)"
 }
 ```
+
+With images, the message also lists the saved paths: `Successfully wrote note: Trip.md (mode: overwrite); saved images: attachments/beach.png`.
 
 ### `patch_note`
 
@@ -955,6 +1009,7 @@ MCPVault applies these checks before file operations:
 
 - **Automatic Exclusions:** `.obsidian`, `.git`, `node_modules`, and system files are filtered
 - **Extension Whitelist:** Only `.md`, `.markdown`, `.txt`, `.base`, and `.canvas` files are accessible by default
+- **Images:** `read_note` and `write_note` handle only PNG, JPEG, GIF, and WebP images inside the vault, with the same traversal, symlink, and restricted-folder checks. Images are never fetched from URLs, and image bytes are checked against the file type.
 - **Hidden File Protection:** Dot files and system directories are automatically excluded
 
 ### Content Validation
@@ -985,6 +1040,7 @@ Only grant write access to clients and conversations you trust. Use `--read-only
 - `src/filesystem.ts` - File operations with path validation
 - `src/pathfilter.ts` - Directory and file filtering
 - `src/search.ts` - Note search functionality with content and frontmatter support
+- `src/images.ts` - Image embed parsing, base64 decoding, and format checks
 - `src/uri.ts` - Obsidian URI generation for deep links
 - `src/types.ts` - TypeScript type definitions
 

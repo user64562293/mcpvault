@@ -88,6 +88,92 @@ test("server can read and write notes via tools", async () => {
   await server.close();
 });
 
+// 1x1 transparent PNG
+const PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+test("read_note and write_note advertise image parameters", async () => {
+  const { server, client } = await connectClient();
+  try {
+    const { tools } = await client.listTools();
+    const readNote = tools.find((t) => t.name === "read_note")!;
+    const writeNote = tools.find((t) => t.name === "write_note")!;
+    expect(readNote.inputSchema.properties).toHaveProperty("includeImages");
+    expect(writeNote.inputSchema.properties).toHaveProperty("images");
+    expect(writeNote.inputSchema.properties).toHaveProperty("attachmentFolder");
+    expect((writeNote.inputSchema.properties as any).images.items.required).toEqual(["filename", "data"]);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("write_note saves images and read_note returns them as image content", async () => {
+  const { server, client } = await connectClient();
+  try {
+    const writeResult = await client.callTool({
+      name: "write_note",
+      arguments: {
+        path: "Trip.md",
+        content: "# Trip",
+        images: [{ filename: "beach.png", data: PNG_BASE64 }],
+        attachmentFolder: "  media  ",
+      },
+    });
+    expect(writeResult.isError).toBeFalsy();
+    expect((writeResult.content as any)[0].text).toBe(
+      "Successfully wrote note: Trip.md (mode: overwrite); saved images: media/beach.png",
+    );
+    expect((await readFile(join(testVaultPath, "media/beach.png"))).toString("base64")).toBe(PNG_BASE64);
+
+    const plain = await client.callTool({ name: "read_note", arguments: { path: "Trip.md" } });
+    expect(plain.content as any).toHaveLength(1);
+    expect(JSON.parse((plain.content as any)[0].text)).toEqual({ fm: {}, content: "# Trip\n\n![[beach.png]]\n" });
+
+    const withImages = await client.callTool({ name: "read_note", arguments: { path: "Trip.md", includeImages: true } });
+    expect(withImages.isError).toBeFalsy();
+    const content = withImages.content as any[];
+    expect(content).toHaveLength(2);
+    expect(JSON.parse(content[0].text)).toEqual({ fm: {}, content: "# Trip\n\n![[beach.png]]\n", imgs: ["media/beach.png"] });
+    expect(content[1]).toEqual({ type: "image", data: PNG_BASE64, mimeType: "image/png" });
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("read_note includeImages reports images it could not load", async () => {
+  const { server, client } = await connectClient();
+  try {
+    await writeFile(join(testVaultPath, "note.md"), "![[missing.png]]");
+    const result = await client.callTool({ name: "read_note", arguments: { path: "note.md", includeImages: true } });
+    expect(result.isError).toBeFalsy();
+    const content = result.content as any[];
+    expect(content).toHaveLength(1);
+    expect(JSON.parse(content[0].text).imgErr).toEqual([
+      { ref: "![[missing.png]]", err: "Image not found in vault: missing.png" },
+    ]);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("write_note returns an error for invalid image data and writes nothing", async () => {
+  const { server, client } = await connectClient();
+  try {
+    const result = await client.callTool({
+      name: "write_note",
+      arguments: { path: "n.md", content: "x", images: [{ filename: "p.png", data: "bm90IGFuIGltYWdl" }] },
+    });
+    expect(result.isError).toBe(true);
+    expect((result.content as any)[0].text).toMatch(/not a valid PNG, JPEG, GIF or WebP image/);
+    await expect(readFile(join(testVaultPath, "n.md"))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test("custom options are applied", () => {
   const server = createServer(testVaultPath, {
     name: "custom-name",
@@ -258,6 +344,7 @@ test("read-only mode exposes read tools and rejects every vault mutation", async
 
     const mutations = [
       { name: "write_note", arguments: { path: "blocked.md", content: "blocked" } },
+      { name: "write_note", arguments: { path: "blocked.md", content: "blocked", images: [{ filename: "blocked.png", data: PNG_BASE64 }] } },
       { name: "patch_note", arguments: { path: "existing.md", oldString: "Safe", newString: "Changed" } },
       { name: "delete_note", arguments: { path: "existing.md", confirmPath: "existing.md" } },
       { name: "move_note", arguments: { oldPath: "existing.md", newPath: "moved.md" } },
@@ -273,6 +360,9 @@ test("read-only mode exposes read tools and rejects every vault mutation", async
     }
 
     await expect(readFile(join(testVaultPath, "blocked.md"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(readFile(join(testVaultPath, "attachments/blocked.png"))).rejects.toMatchObject({
       code: "ENOENT",
     });
     expect(await readFile(join(testVaultPath, "existing.md"), "utf8")).toBe(

@@ -40,6 +40,7 @@ src/
   frontmatter.ts       # FrontmatterHandler — YAML parsing via gray-matter
   pathfilter.ts        # PathFilter — security layer for path validation
   search.ts            # SearchService — full-text search with token-optimized output
+  images.ts            # Image embed parsing, base64 decoding, magic-byte checks (pure, no fs)
   uri.ts               # Obsidian URI generation
   types.ts             # All TypeScript interfaces
   *.test.ts            # Co-located test files
@@ -62,10 +63,10 @@ website-shibumi/       # Bun + Hono + TSX website serving mcpvault.org (separate
 
 | Tool | Description |
 |------|-------------|
-| read_note | Read a single note with frontmatter |
+| read_note | Read a single note with frontmatter; `includeImages` also returns embedded images as image content |
 | get_note_outline | Return note headings with levels and line numbers |
 | read_note_lines | Read an inclusive line range from a note |
-| write_note | Create or overwrite (supports overwrite, append, prepend modes) |
+| write_note | Create or overwrite (supports overwrite, append, prepend modes); `images` saves base64 images to the attachment folder and embeds them |
 | patch_note | Efficient partial update via find-and-replace |
 | list_directory | List files and folders in the vault |
 | delete_note | Delete a note (requires path confirmation) |
@@ -94,6 +95,7 @@ website-shibumi/       # Bun + Hono + TSX website serving mcpvault.org (separate
 - **Frontmatter**: Always use FrontmatterHandler for read/write. `originalContent` field has raw file content. Empty frontmatter = no YAML block.
 - **Write modes**: overwrite (default), append (content to end, merge frontmatter), prepend (content to beginning, merge frontmatter)
 - **Patch**: Exact string match including whitespace/newlines. `replaceAll: false` (default) fails on multiple matches to prevent accidents.
+- **Images**: PNG/JPEG/GIF/WebP only, max 10 per call, 5 MB each, bytes magic-checked. Image paths go through `isAllowedForListing` + `resolvePath()` (the note-only `isAllowed` rejects image extensions). Attachment folder: `attachmentFolder` arg → `.obsidian/app.json` `attachmentFolderPath` (read internally only) → `attachments`. write_note validates every image before writing, never overwrites (`wx`), and removes saved images if the note write fails. Remote URLs are never fetched.
 - **Version**: Read from `package.json` at runtime. Used in MCP server init, --version flag, and website nav badge.
 
 ## Website (Dual Content)
